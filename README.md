@@ -2,7 +2,7 @@
 # AlphaFold3 on ALICE
 *By Belmin Bajramovic [@B-Bajramovic](https://github.com/B-Bajramovic)*
 
-Running AlphaFold on HPC ALICE requires preparation and some assistance if you are new to HPCs. We cannot directly run the prediction like you would on your own computer. On ALICE we use SLURM as a queuing system to organise faculty-wide usage. This guide prepares your job for submission using a script.
+This page prepares your AlphaFold3 job for submission to SLURM on HPC ALICE. 
 
 For more on structural bioinformatics tools visit our other pages or contact us directly.
 
@@ -10,14 +10,14 @@ For more on structural bioinformatics tools visit our other pages or contact us 
 ## 1. input
 ---
 
-AF3 accepts input in JSON format. For proteins, we have a script that converts fasta to json. It can take multiple fasta files at once if you refer to the directory containing the files. There are some default settings to the script that you can adjust once you understand what you are doing.
+AF3 accepts input in JSON format. You can input single proteins, PPI-complexes, as well as ligands and ions. To make this more convenient I have prepared a script to automate FASTA to JSON conversion, prepare SBATCH subsmission script for SLURM, and a few more advanced, optional features. 
 
 Requirements for the script are
 - Python3.10+
 - Bio (python package, can be installed in conda using: conda install Bio -c bioconda)
 
 ```
-python AF3_job_prepare.py --prey /path/to/directory/with/fasta/files --project name_of_project --make-sbatch --job-dirs
+python AF3_prepare.py --prey /path/to/directory/with/fasta/files --project name_of_project --make-sbatch --job-dirs
 
 ```
 The full options of the script are a bit intimidating, but to begin you only need --prey, which refers to your fasta file, and --project, which is the directory into which your json file will go and your AlphaFold3 output later on. The --make-sbatch and --job-dirs options let the python script prepare the slurm job for you.
