@@ -1,4 +1,41 @@
 #!/usr/bin/env python3
+"""
+AF3_prepare.py
+
+Creates per job directories containing:
+  - input.json (AlphaFold3 style by default)
+  - job.sbatch (optional)
+  - submit_all.sh (optional)
+
+Supports:
+  - ions (via ligand CCD codes such as ZN, MG, CA, NA, CL)
+  - small molecules (any CCD code, optionally multiple copies)
+  - alphafold3 dialect as the default schema
+  - alphafoldserver schema if needed
+
+Important behavior:
+  - For alphafold3 schema, --prey-count and --bait-count are implemented by
+    duplicating protein chains with new chain ids (A, B, C...).
+  - For alphafoldserver schema, counts are written using proteinChain.count.
+
+Examples
+
+Single protein, include zinc:
+  ./AF3_prepare.py my.fasta --ion ZN
+
+Single protein homotetramer in alphafold3 schema, include zinc:
+  ./AF3_prepare.py my.fasta --schema alphafold3 --prey-count 4 --ion ZN
+
+PPI, include a small molecule ligand ATP and zinc:
+  ./AF3_prepare.py prey_dir --bait bait.fasta --mode ppi --ligand ATP --ion ZN
+
+PPI with bait dimer and prey monomer in alphafold3 schema:
+  ./AF3_prepare.py prey_dir --bait bait.fasta --mode ppi --schema alphafold3 --bait-count 2 --prey-count 1
+
+Emit alphafoldserver format:
+  ./AF3_prepare.py my.fasta --schema alphafoldserver --prey-count 2
+"""
+
 import json
 import random
 import argparse
@@ -14,6 +51,10 @@ JSON_EXTS = {".json"}
 
 DEFAULT_AF3_DIALECT = "alphafold3"
 DEFAULT_AF3_VERSION = 2
+
+COMMON_IONS = {
+    "ZN", "MG", "CA", "NA", "K", "CL", "MN", "FE", "CU", "CO", "NI", "CD",
+}
 
 
 @dataclass
@@ -233,6 +274,27 @@ def make_ligand_entries(ccd_codes: List[str], start_chain_index: int = 0) -> Lis
     return sequences
 
 
+def expand_protein_chains_af3(seqs: List[str], counts: List[int]) -> (List[str], List[str]):
+    """
+    For alphafold3 schema, implement counts by duplicating sequences and chain ids.
+    Returns expanded_seqs and expanded_chain_ids.
+    """
+    if len(seqs) != len(counts):
+        raise ValueError("seqs and counts must have same length")
+    expanded_seqs: List[str] = []
+    expanded_chain_ids: List[str] = []
+    chain_index = 0
+    for s, c in zip(seqs, counts):
+        c = int(c)
+        if c <= 0:
+            raise ValueError("Counts must be positive")
+        for _ in range(c):
+            expanded_seqs.append(s)
+            expanded_chain_ids.append(chain_id_from_index(chain_index))
+            chain_index += 1
+    return expanded_seqs, expanded_chain_ids
+
+
 def job_obj_alphafoldserver(name: str, seqs: List[str], counts: List[int], seeds: List[int]) -> dict:
     sequences = []
     for s, c in zip(seqs, counts):
@@ -249,15 +311,18 @@ def job_obj_alphafoldserver(name: str, seqs: List[str], counts: List[int], seeds
 def job_obj_alphafold3(
     name: str,
     seqs: List[str],
-    chain_ids: List[str],
+    counts: List[int],
     seeds: List[int],
     ligand_ccd_codes: Optional[List[str]] = None,
     dialect: str = DEFAULT_AF3_DIALECT,
     version: int = DEFAULT_AF3_VERSION,
     unpaired_msa_path: Optional[str] = None,
 ) -> dict:
+    # Expand proteins by count into explicit chains
+    expanded_seqs, expanded_chain_ids = expand_protein_chains_af3(seqs, counts)
+
     sequences: List[dict] = []
-    for s, cid in zip(seqs, chain_ids):
+    for s, cid in zip(expanded_seqs, expanded_chain_ids):
         prot_obj = {"id": cid, "sequence": s}
         if unpaired_msa_path:
             prot_obj["unpairedMsaPath"] = unpaired_msa_path
@@ -265,8 +330,10 @@ def job_obj_alphafold3(
             prot_obj["templates"] = []
         sequences.append({"protein": prot_obj})
 
+    # Append ligand entries after protein chains
     if ligand_ccd_codes:
-        sequences.extend(make_ligand_entries(ligand_ccd_codes, start_chain_index=len(chain_ids)))
+        start_idx = len(expanded_chain_ids)
+        sequences.extend(make_ligand_entries(ligand_ccd_codes, start_chain_index=start_idx))
 
     return {
         "name": name,
@@ -294,45 +361,55 @@ def choose_default_outdir_name(
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Make AF3 job dirs + input.json + sbatch. AF3 ligands supported for alphafold3 schema."
+        description="Make AF3 job dirs, input.json, and sbatch. Supports ligands and ions in alphafold3 schema."
     )
 
-    p.add_argument("input", help="Prey input: FASTA/JSON file OR directory")
-    p.add_argument("--bait", default=None, help="Optional bait input: FASTA/JSON file OR directory")
+    p.add_argument("input", help="Prey input: FASTA or JSON file, or a directory of FASTA or JSON")
+    p.add_argument("--bait", default=None, help="Optional bait input: FASTA or JSON file, or a directory")
     p.add_argument("--mode", choices=["auto", "single", "ppi"], default="auto")
 
     p.add_argument(
         "--schema",
         choices=["alphafold3", "alphafoldserver"],
         default="alphafold3",
-        help="Which JSON schema to emit. Default alphafold3 writes one object per JSON file.",
+        help="Which JSON schema to emit. Default is alphafold3.",
     )
 
-    p.add_argument("--seeds", type=int, default=5)
-    p.add_argument("--seed-base", type=int, default=None)
+    p.add_argument("--seeds", type=int, default=5, help="How many modelSeeds to write")
+    p.add_argument("--seed-base", type=int, default=None, help="Deterministic seeds starting at this integer")
 
-    p.add_argument("--outdir", default=None)
-    p.add_argument("--project", default=None)
+    p.add_argument("--outdir", default=None, help="Output directory root. If omitted, derived from headers")
+    p.add_argument("--project", default=None, help="Optional grouping folder under outdir")
 
-    p.add_argument("--no-sbatch", action="store_true")
-    p.add_argument("--submit-script", action="store_true")
+    p.add_argument("--no-sbatch", action="store_true", help="Do not write job.sbatch files")
+    p.add_argument("--submit-script", action="store_true", help="Write submit_all.sh in the output root")
 
-    p.add_argument("--prey-count", type=int, default=1)
-    p.add_argument("--bait-count", type=int, default=1)
-    p.add_argument("--name-template", default="{bait}_with_{prey}")
+    p.add_argument("--prey-count", type=int, default=1, help="Copies of prey chain(s). Works for both schemas")
+    p.add_argument("--bait-count", type=int, default=1, help="Copies of bait chain. Works for both schemas")
+    p.add_argument("--name-template", default="{bait}_with_{prey}", help="PPI name template")
     p.add_argument("--skip-self", action="store_true")
 
-    p.add_argument("--ion", action="append", default=[], help="Ion CCD code, optionally with :count (e.g. ZN or ZN:2)")
+    p.add_argument(
+        "--ion",
+        action="append",
+        default=[],
+        help="Add ion(s) by CCD code, optionally with count. Example: --ion ZN or --ion ZN:2",
+    )
     p.add_argument(
         "--ligand",
         action="append",
         default=[],
-        help="Ligand CCD code, optionally with :count (e.g. ATP or HEM:2)",
+        help="Add small molecule ligand(s) by CCD code, optionally with count. Example: --ligand ATP or --ligand HEM:2",
     )
 
-    p.add_argument("--af3-dialect", default=DEFAULT_AF3_DIALECT)
-    p.add_argument("--af3-version", type=int, default=DEFAULT_AF3_VERSION)
-    p.add_argument("--unpaired-msa-path", default=None)
+    p.add_argument("--af3-dialect", default=DEFAULT_AF3_DIALECT, help="AlphaFold3 dialect field")
+    p.add_argument("--af3-version", type=int, default=DEFAULT_AF3_VERSION, help="AlphaFold3 version field")
+
+    p.add_argument(
+        "--unpaired-msa-path",
+        default=None,
+        help="Optional unpairedMsaPath to include in AlphaFold3 protein objects",
+    )
 
     p.add_argument("--af3-module-profile", choices=["cc7", "cc8"], default="cc8")
     p.add_argument("--partition", default=None)
@@ -366,19 +443,32 @@ def main() -> None:
             raise SystemExit("PPI mode requires --bait")
         bait_prots = [SimpleProtein(sanitize_name(x.id), x.seq) for x in load_proteins(Path(args.bait))]
         if len(bait_prots) != 1:
-            raise SystemExit("ERROR: --bait must resolve to exactly one sequence for PPI.")
+            raise SystemExit("ERROR: --bait must resolve to exactly one sequence for PPI in this script.")
         bait = bait_prots[0]
+
+    if int(args.prey_count) <= 0:
+        raise SystemExit("ERROR: --prey-count must be positive")
+    if int(args.bait_count) <= 0:
+        raise SystemExit("ERROR: --bait-count must be positive")
 
     ion_items = parse_ccd_list(args.ion)
     ligand_items = parse_ccd_list(args.ligand)
     ligand_ccd_codes = merge_ccd_items(ion_items, ligand_items)
+
+    for it in ion_items:
+        if it.ccd.upper() not in COMMON_IONS:
+            pass
 
     seeds = make_model_seeds(args.seeds, args.seed_base)
     module_load = module_string(args.af3_module_profile)
     partition = args.partition if args.partition else default_partition(args.af3_module_profile)
     make_sbatch = not args.no_sbatch
 
-    out_root = Path(args.outdir) if args.outdir else Path(choose_default_outdir_name(mode, prey_input, prey_prots, bait))
+    if args.outdir:
+        out_root = Path(args.outdir)
+    else:
+        out_root = Path(choose_default_outdir_name(mode, prey_input, prey_prots, bait))
+
     if args.project:
         out_root = out_root / sanitize_name(args.project)
 
@@ -391,14 +481,7 @@ def main() -> None:
         job_dirs.append(jd)
 
         input_path = jd / "input.json"
-
-        # Critical fix:
-        # alphafold3 schema expects exactly one object per JSON file (no list wrapper)
-        # alphafoldserver schema commonly supports list-of-jobs per file
-        if args.schema == "alphafold3":
-            payload: Union[dict, List[dict]] = obj
-        else:
-            payload = [obj]
+        payload = [obj]
 
         if args.dry_run:
             print(f"[dry-run] mkdir -p {jd}")
@@ -437,13 +520,20 @@ def main() -> None:
         for prey in prey_prots:
             if args.schema == "alphafoldserver":
                 if ligand_ccd_codes:
-                    raise SystemExit("ERROR: --ion/--ligand supported only for --schema alphafold3.")
-                obj = job_obj_alphafoldserver(prey.id, [prey.seq], [args.prey_count], seeds)
+                    raise SystemExit(
+                        "ERROR: --ion and --ligand are supported only for --schema alphafold3 in this script."
+                    )
+                obj = job_obj_alphafoldserver(
+                    name=prey.id,
+                    seqs=[prey.seq],
+                    counts=[int(args.prey_count)],
+                    seeds=seeds,
+                )
             else:
                 obj = job_obj_alphafold3(
                     name=prey.id,
                     seqs=[prey.seq],
-                    chain_ids=["A"],
+                    counts=[int(args.prey_count)],
                     seeds=seeds,
                     ligand_ccd_codes=ligand_ccd_codes,
                     dialect=args.af3_dialect,
@@ -458,15 +548,23 @@ def main() -> None:
             if args.skip_self and prey.id == bait_id:
                 continue
             name = args.name_template.format(bait=bait_id, prey=prey.id)
+
             if args.schema == "alphafoldserver":
                 if ligand_ccd_codes:
-                    raise SystemExit("ERROR: --ion/--ligand supported only for --schema alphafold3.")
-                obj = job_obj_alphafoldserver(name, [bait.seq, prey.seq], [args.bait_count, args.prey_count], seeds)
+                    raise SystemExit(
+                        "ERROR: --ion and --ligand are supported only for --schema alphafold3 in this script."
+                    )
+                obj = job_obj_alphafoldserver(
+                    name=name,
+                    seqs=[bait.seq, prey.seq],
+                    counts=[int(args.bait_count), int(args.prey_count)],
+                    seeds=seeds,
+                )
             else:
                 obj = job_obj_alphafold3(
                     name=name,
                     seqs=[bait.seq, prey.seq],
-                    chain_ids=["A", "B"],
+                    counts=[int(args.bait_count), int(args.prey_count)],
                     seeds=seeds,
                     ligand_ccd_codes=ligand_ccd_codes,
                     dialect=args.af3_dialect,
@@ -500,9 +598,12 @@ def main() -> None:
         print(f"### Done. Output dir: {out_root}")
         print(f"### Jobs: {len(job_dirs)}")
         print(f"### Logs dir: {logs_dir}")
-        print(f"### Schema: {args.schema}")
-        if args.schema == "alphafold3" and ligand_ccd_codes:
-            print(f"### Ligands (CCD): {', '.join(ligand_ccd_codes)}")
+        print(f"### Sbatch: {'on' if make_sbatch else 'off'}")
+        if args.schema == "alphafold3":
+            if int(args.prey_count) != 1 or int(args.bait_count) != 1:
+                print(f"### Protein copies: bait={int(args.bait_count)} prey={int(args.prey_count)}")
+            if ligand_ccd_codes:
+                print(f"### Ligands appended (CCD): {', '.join(ligand_ccd_codes)}")
 
 
 if __name__ == "__main__":
